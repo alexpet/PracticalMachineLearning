@@ -1,0 +1,596 @@
+---
+title: "Practical Machine Learning Project"
+author: "Alex Petkovski"
+date: "Wednesday, July 26, 2015"
+output: 
+    html_document:
+        toc: true
+        theme: united
+---
+
+#Summary   
+The goal of the project is to make a *machine learning model* to predict categorical 
+data regarding proper execution of exercises accoring to five outcomes labelled in 
+data A through E. The model should generalize well and the expected performance of 
+the trained model will be shown. The process will involve the following steps. 
+
+#Data Preparation   
+Here we load packages, download data if necessary and partition data into various 
+training/validation and out of sample testing sets. See appendix **PackagesUsed** 
+for R code.
+```{r, PackagesUsed, echo=FALSE, message=FALSE, comment=FALSE, results='hide'}
+library(caret)
+library(car)
+library(gridExtra)
+library(doParallel)
+library(rattle)
+registerDoParallel(cores=3)
+```
+
+##Loading the Data   
+After loading the dataset, we do some exploratory analysis. Files are expected to
+be stored in `\data` subdirectory of the current working directory and will be
+downloaded if they are not there. We also set some working locations for cached 
+files in order to allow the model to run faster if it has already been generated. 
+See appendix **LoadDataSet** for R code and summary table of training data.
+```{r, LoadDataSet, echo=FALSE, message=FALSE, comment=FALSE, results='hide'}
+# URL variable for files to download and filename
+trainFileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testFileUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+destFolder <- "./data"
+trainFile <- "./data/pml-training.csv"
+testFile <- "./data/pml-testing.csv"
+rds.modelLda <- "./rds/modelLda.rds"
+rds.modelLdaPca <- "./rds/modelLdaPca.rds"
+rds.modelNb <- "./rds/modelNb.rds"
+rds.modelNbPca <- "./rds/modelNbPca.rds"
+rds.modelQda <- "./rds/modelQda.rds"
+rds.modelQdaPca <- "./rds/modelQdaPca.rds"
+rds.modelTree <- "./rds/modelTree.rds"
+rds.modelTree2 <- "./rds/modelTree2.rds"
+rds.modelGbm <- "./rds/modelGbm.rds"
+rds.modelGbmPca <- "./rds/modelGbmPca.rds"
+rds.modelRf <- "./rds/modelRf.rds"
+rds.modelRf30 <- "./rds/modelRf30.rds"
+rds.modelRf.sample <- "./rds/modelRf.sample.rds"
+rds.modelRf.sample2 <- "./rds/modelRf.sample2.rds"
+rds.modelRf.sample3 <- "./rds/modelRf.sample3.rds"
+
+# Make a data directory if it doesn't exist
+mainDir <- getwd()
+subDir <- "data"
+rdsDir <- "rds"
+
+if (!file.exists(subDir)){
+    dir.create(file.path(mainDir, subDir))
+}
+
+if (!file.exists(rdsDir)){
+    dir.create(file.path(mainDir, rdsDir))
+}
+
+# Download files if necessary
+if(!file.exists(trainFile)) {download.file(trainFileUrl, trainFile)}
+if(!file.exists(testFile)) {download.file(testFileUrl, testFile)}
+
+# Read files into a data frames
+trainData <- read.csv(trainFile)
+testData <- read.csv(testFile)
+
+#Initial exploration of the trainData
+summary(trainData)
+
+#This revealed certain columns not useful for prediction which are removed
+trainData <- trainData[,-which(names(trainData) 
+                               %in% c("X",
+                                      "user_name",
+                                      "raw_timestamp_part_1",
+                                      "raw_timestamp_part_2",
+                                      "cvtd_timestamp",
+                                      "new_window",
+                                      "num_window"
+                                      ))
+                       ]
+
+#The test data reveals NA for summary statistics. These are removed as well.
+trainData <- trainData[, -c(grep("kurtosis_", names(trainData)))]
+trainData <- trainData[, -c(grep("skewness_", names(trainData)))]
+trainData <- trainData[, -c(grep("max_", names(trainData)))]
+trainData <- trainData[, -c(grep("min_", names(trainData)))]
+trainData <- trainData[, -c(grep("amplitude_", names(trainData)))]
+trainData <- trainData[, -c(grep("var_", names(trainData)))]
+trainData <- trainData[, -c(grep("stddev_", names(trainData)))]
+trainData <- trainData[, -c(grep("avg_", names(trainData)))]
+```
+
+##Splitting the Data   
+From the data, we see that `classe` is what we are trying to predict in the 
+testData. Since we don't have any test data to really test our predictions and we
+have a large amount of data to work with, we will split the data 70% training/cross-
+validation and 30% out of sample testing. See appendix **DataSplitting** for R 
+code.
+```{r, DataSplitting, echo=FALSE, message=FALSE, comment=FALSE, results='hide'}
+set.seed(1138)
+inTrain <- createDataPartition(y=trainData$classe, p=0.7, list=FALSE)
+training <- trainData[inTrain,]
+testing <- trainData[-inTrain,]
+```
+
+#Data Exploration   
+In this part, our aim is to do some preliminary data exploration and build some 
+quick machine learning models in order to try to understand the data better. This 
+will hopefully steer us toward the correct model selection. 
+
+##Principal Component Analysis   
+Let's explore data to see if any correlation exists in the predictors. If there are 
+any, we will check if Principal Component Analysis can be used to reduce the number 
+of predictors. See appendix **Covariates** for the R code.
+```{r, Covariates, echo=FALSE, message=FALSE, comment=FALSE}
+trainingCov <- training[,-which(names(training)=="classe")]
+asNumeric <- function(x) as.numeric(as.character(x))
+factorsNumeric <- function(d) modifyList(d, lapply(d[, sapply(d, is.integer)],   
+                                                   asNumeric))
+trainCov <- factorsNumeric(trainingCov)
+M <- abs(cor(trainCov))
+diag(M) <- 0
+which(M > 0.8,arr.ind=T)
+```
+ 
+It looks like we found several correlated covariates. So, a non-linear model is probably 
+best to use here or we should do PCA to try and reduce the impact. We'll explore 
+some linear models anyway where PCA might be useful. 
+
+##Check for Zero Covariates 
+We do a check for zero covariates to see if there are any additional variables that 
+can be removed. 
+```{r, ZeroCovariates, message=FALSE, comment=FALSE}
+nsv <- nearZeroVar(trainCov, saveMetrics=TRUE)
+subset(nsv, zeroVar == TRUE || nsv == TRUE)
+```
+ 
+We didn't find any additional covariates to remove. Let's set the general fit control. 
+For the general method, we're using 10-fold cross validation repeated 10 times. 
+```{r, TrainControl, message=FALSE, comment=FALSE}
+fitControl <- trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           ## repeated ten times
+                           repeats = 10)
+```
+ 
+##Fitting a Tree to determine variable importance 
+To begin somewhere, let's try to fit a tree model and then fit similar models to 
+determine best model selection using an apples to apples comparison. 
+```{r, FirstTreeModel, message=FALSE, comment=FALSE}
+#Use the cached model if it exists, otherwise train a new model
+if(file.exists(rds.modelTree)) {
+    modelTree = readRDS(rds.modelTree)
+} else {
+    set.seed(1138)
+    modelTree <- train(classe ~ ., 
+                   method = "rpart", 
+                   data = training,
+                   trControl = fitControl,
+                   verbose = FALSE)
+    saveRDS(modelTree, file=rds.modelTree)
+}
+```
+ 
+From the first model, let's see if we can narrow down the list of variables to the 
+most important predictors. 
+```{r VariableImportance, message=FALSE, comment=FALSE}
+imp <- varImp(modelTree,surrogates=FALSE,competes=TRUE)$importance
+subset(imp,Overall>0)
+```
+ 
+Looks like we can remove gyros parameters safely. Let's graph the most important 
+variables first to see how predictive they might be. See appendix **PlotImportantVariables** 
+for R code. 
+ 
+```{r PlotImportantVariables, echo=FALSE, message=FALSE, comment=FALSE, results='hide'}
+g1 <- qplot(pitch_forearm, roll_forearm, colour=classe, data=training)
+g2 <- qplot(pitch_forearm, roll_belt, colour=classe, data=training)
+g3 <- qplot(pitch_forearm, magnet_dumbbell_y, colour=classe, data=training)
+g4 <- qplot(roll_forearm, roll_belt, colour=classe, data=training)
+g5 <- qplot(roll_forearm, magnet_dumbbell_y, colour=classe, data=training)
+g6 <- qplot(roll_belt, magnet_dumbbell_y, colour=classe, data=training)
+grid.arrange( g1, g2, g3, g4, g5, g6,ncol=2 )
+# Some house keeping
+rm(list=c("g1","g2","g3","g4","g5","g6"))
+```
+ 
+It looks like there are several useful patterns visible in the top 6 most important 
+predictors that the *machine learning* algorithm might exploit. 
+
+#Initial Models   
+In this section, we now do several models using the reduced predictors from the 
+first exploration. We will continue to try to simplify the model as we go on. 
+
+## First test model - CART   
+Now let's train a Tree model without gyros. First we define a new training set and 
+then train a second Tree with fewer paramters. See appendix **SetSmallerTrainingSet** 
+for R Code. 
+```{r SetSmallerTrainingSet, echo=FALSE, message=FALSE, comment=FALSE}
+training2 <- training[, -c(grep("gyros_", names(training)))]
+testing2 <- testing[, -c(grep("gyros_", names(testing)))]
+# Train model again without gyros
+if(file.exists(rds.modelTree2)) {
+    modelTree2 = readRDS(rds.modelTree2)
+} else {
+    set.seed(1138)
+    modelTree2 <- train(classe ~ ., 
+                   method = "rpart", 
+                   data = training2,
+                   trControl = fitControl,
+                   verbose = FALSE)
+    saveRDS(modelTree2, file=rds.modelTree2)
+}
+# Checking if we get the same results
+modelTree$results$Accuracy == modelTree2$results$Accuracy
+# Storing the result for later
+rCart <- max(modelTree2$results$Accuracy)
+modelTree2
+```
+ 
+Fantastic, we reduced predictor variable count from 52 to 40 and maintained the same 
+accuracy . We will use this lower number and try a few different models for initial
+training model selection. Later on we will tweak the actual parameters for the best 
+model selected. Let's review the tree diagram first. 
+ 
+```{r TreeDiagram, echo=FALSE, message=FALSE, comment=FALSE}
+fancyRpartPlot(modelTree2$finalModel)
+```
+ 
+## Principal Component Analysis Models   
+It looks like there are `r dim(which(M > 0.8, arr.ind=T))[1]` instances of correlated 
+predictors. If we use a linear model then Principal Component Analysis may be useful
+here. Let's explore some models that might benefit from PCA, namely:   
+* Linear Discriminant Analysis `lda`   
+* Quadratic Discriminant analysis `qda`   
+* Generalized regression boosing `gbm`   
+* Negative binomial `nb`   
+See appending **PrincipalComponentModels** for R code. 
+```{r, PrincipalComponentModels, echo=FALSE, message=FALSE, comment=FALSE, results='hide'}
+# LDA models
+if(file.exists(rds.modelLda)) {
+    modelLda = readRDS(rds.modelLda)
+} else {
+    set.seed(1138)
+    modelLda <- train(classe ~ ., 
+                   method = "lda", 
+                   data = training2,
+                   trControl = fitControl,
+                   verbose = FALSE)
+    saveRDS(modelLda, file=rds.modelLda)
+}
+
+if(file.exists(rds.modelLdaPca)) {
+    modelLdaPca = readRDS(rds.modelLdaPca)
+} else {
+    set.seed(1138)
+    modelLdaPca <- train(classe ~ ., 
+                   method = "lda", 
+                   data = training2,
+                   trControl = fitControl,
+                   preProcess = "pca",
+                   verbose = FALSE)
+    saveRDS(modelLdaPca, file=rds.modelLdaPca)
+}
+
+# QDA models
+if(file.exists(rds.modelQda)) {
+    modelQda = readRDS(rds.modelQda)
+} else {
+    set.seed(1138)
+    modelQda <- train(classe ~ ., 
+                   method = "qda", 
+                   data = training2,
+                   trControl = fitControl,
+                   verbose = FALSE)
+    saveRDS(modelQda, file=rds.modelQda)
+}
+
+if(file.exists(rds.modelQdaPca)) {
+    modelQdaPca = readRDS(rds.modelQdaPca)
+} else {
+    set.seed(1138)
+    modelQdaPca <- train(classe ~ ., 
+                   method = "qda", 
+                   data = training2,
+                   trControl = fitControl,
+                   preProcess = "pca",
+                   verbose = FALSE)
+    saveRDS(modelQdaPca, file=rds.modelQdaPca)
+}
+
+# NB models
+if(file.exists(rds.modelNb)) {
+    modelNb = readRDS(rds.modelNb)
+} else {
+    set.seed(1138)
+    modelNb <- train(classe ~ ., 
+                   method = "nb", 
+                   data = training2,
+                   trControl = fitControl,
+                   verbose = FALSE)
+    saveRDS(modelNb, file=rds.modelNb)
+}
+
+if(file.exists(rds.modelNbPca)) {
+    modelNbPca = readRDS(rds.modelNbPca)
+} else {
+    set.seed(1138)
+    modelNbPca <- train(classe ~ ., 
+                   method = "nb", 
+                   data = training2,
+                   trControl = fitControl,
+                   preProcess = "pca",
+                   verbose = FALSE)
+    saveRDS(modelNbPca, file=rds.modelNbPca)
+}
+
+# GBM models
+if(file.exists(rds.modelGbm)) {
+    modelGbm = readRDS(rds.modelGbm)
+} else {
+    registerDoParallel(cores=1)
+    set.seed(1138)
+    modelGbm <- train(classe ~ ., 
+                   method = "gbm", 
+                   data = training2,
+                   trControl = fitControl,
+                   verbose = FALSE)
+    saveRDS(modelGbm, file=rds.modelGbm)
+}
+
+# Store the accuracy results
+rLda <- modelLda$results$Accuracy
+rLdaP <- modelLdaPca$results$Accuracy
+rQda <- modelQda$results$Accuracy
+rQdaP <- modelQdaPca$results$Accuracy
+rNb <- max(modelNb$results$Accuracy)
+rGbm <- max(modelGbm$results$Accuracy)
+```
+ 
+Fitting some of these models took a long time, so I skipped the second `gbm` using 
+PCA and focused on the `rf` method. But this took several hours with 42 
+variables, so I needed a new approach.  
+
+## Random Forest Tuning   
+It turns out that I could not get a `rf` model to run with full training data, so I
+made an attempt to do some sample training to reduce training parameters further. 
+See appendix **RfTuning** for R code. 
+```{r, RfTuning, echo=FALSE, message=FALSE, comment=FALSE, results='hide'}
+# Sample model of 1000 using default parameters
+if(file.exists(rds.modelRf.sample)) {
+    modelRf.sample = readRDS(rds.modelRf.sample)
+} else {
+    set.seed(1138)
+    modelRf.sample <- train(classe ~ ., 
+                   method = "rf", 
+                   data = training[sample(1:dim(training)[1],1000),],
+                   trControl = fitControl,
+                   prox = TRUE,
+                   verbose = FALSE)
+    saveRDS(modelRf.sample, file=rds.modelRf.sample)
+}
+
+
+# Identify the parameters and used it to set predictors for rf
+imp2 <- varImp(modelRf.sample)$importance
+imp2 <- cbind(par=row.names(imp2),overall=imp2)
+imp2 <- imp2[order(imp2[,2],decreasing=TRUE),]
+
+# Sample model of 1000 using top 30 parameters
+pars <- as.character(imp2[1:30,1])
+pars <- c(pars,"classe")
+if(file.exists(rds.modelRf.sample2)) {
+    modelRf.sample2 = readRDS(rds.modelRf.sample2)
+} else {
+    set.seed(1138)
+    modelRf.sample2 <- train(classe ~ ., 
+                   method = "rf", 
+                   data = subset(training[sample(1:dim(training)[1],1000),],select=pars),
+                   trControl = fitControl,
+                   prox = TRUE,
+                   verbose = FALSE)
+    saveRDS(modelRf.sample2, file=rds.modelRf.sample2)
+}
+
+# Sample model of 1000 using training2 parameters
+if(file.exists(rds.modelRf.sample3)) {
+    modelRf.sample3 = readRDS(rds.modelRf.sample3)
+} else {
+    set.seed(1138)
+    modelRf.sample3 <- train(classe ~ ., 
+                   method = "rf", 
+                   data = training2[sample(1:dim(training2)[1],1000),],
+                   trControl = fitControl,
+                   prox = TRUE,
+                   verbose = FALSE)
+    saveRDS(modelRf.sample3, file=rds.modelRf.sample3)
+}
+
+# Set up training3 for RF30 model
+training3 <- subset(training,select=pars)
+testing3 <- subset(testing,select=pars)
+
+```
+ 
+The good news is that we got a good model with only 30 paramaters on the sample 
+test. It even did better than the 40 parameter training2 models we have been working 
+with so far. The bad news is, I ran into trouble on my PC and could not finish the 
+RF final model. My memory kept maxing out even on a single core even though I have 
+8BG, thus I could not complete in time for submission. The code I attempted to run 
+is below. 
+```{r FinalRfModels, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+if(file.exists(rds.modelRf30)) {
+    modelRf30 = readRDS(rds.modelRf30)
+} else {
+    registerDoParallel(cores=1)
+    set.seed(1138)
+    modelRf30 <- train(classe ~ ., 
+                   method = "rf", 
+                   data = training3,
+                   trControl = fitControl,
+                   prox = TRUE,
+                   verbose = FALSE)
+    saveRDS(modelRf30, file=rds.modelRf30)
+}
+
+if(file.exists(rds.modelRf)) {
+    modelRf = readRDS(rds.modelRf)
+} else {
+    registerDoParallel(cores=1)
+    set.seed(1138)
+    modelRf <- train(classe ~ ., 
+                   method = "rf", 
+                   data = training2,
+                   trControl = fitControl,
+                   prox = TRUE,
+                   verbose = FALSE)
+    saveRDS(modelRf, file=rds.modelRf)
+}
+```
+ 
+#Model Selection   
+So with reduced components in PCA and some additional models trained, we are ready 
+to begin model selection. For this I am comparing models by accuracy. 
+```{r, modelFits, echo=TRUE, message = FALSE, comment = FALSE}
+results <- cbind(c("CART","LDA","LDA_P","QDA","QDA_P","NB","GBM"),
+                 rbind(rCart,rLda,rLdaP,rQda,rQdaP,rNb,rGbm))
+results <- as.data.frame(results)
+names(results) <- c("Model","Accuracy")
+results$Accuracy <- as.numeric(as.character(results$Accuracy))
+results <- results[order(results[,2],decreasing=TRUE),]
+results
+```
+ 
+From this result, our best completed models are `gbm` with accuracy of `r rGbm` and 
+`qda` with accuracy of `r rQda`. Note that no model that was testing with Principal 
+Component Analysis performed well. Thus, we select based on best accuracy `gbm`, 
+the details of which you can see below: 
+```{r ShowSelectedModelmessage=FALSE, comment=FALSE}
+modelGbm
+```
+
+##Confusion Matrix
+Let's run the Confusion matrix now on the Out of Sample Test data for the top 2 models 
+as thest look the most promising. See appendix **ConfusionMatrix** for the R code. 
+```{r ConfusionMatrix, echo=FALSE, message=FALSE, comment=FALSE, results='hide'}
+cMatrixQda <- confusionMatrix(testing$classe,predict(modelQda,testing))
+cMatrixGbm <- confusionMatrix(testing$classe,predict(modelGbm,testing))
+ostAccuracyQda <- cMatrixQda$overall[1]
+ostAccuracyGbm <- cMatrixGbm$overall[1]
+ostAccuracyLowerGbm <- cMatrixGbm$overall[3]
+ostAccuracyUpperGbm <- cMatrixGbm$overall[4]
+```
+
+##Confusion Matrix - Quadratic discriminant analysis   
+See **ConfusionMatrixQda** for R code. 
+```{r ConfusionMatrixQda, echo=FALSE, message=FALSE, comment=FALSE}
+cMatrixQda
+```
+ 
+The accuracy for Out of Sample testing data was `r ostAccuracyQda` which is consistent 
+with the training and cross-validation results of the model. It was not the best 
+result, which follows now: 
+
+##Confusion Matrix - General regression boosting   
+See **ConfusionMatrixGbm** for R code. 
+```{r ConfusionMatrixGbm, echo=FALSE, message=FALSE, comment=FALSE}
+cMatrixGbm
+cMatrixGbm$table
+```
+ 
+The accuracy for Out of Sample testing was excellent at `r ostAccuracyGbm` which is 
+also consistent with the training and cross-validation results of the `gbm` model. 
+Note also that out of sample testing shows a good 95% confidence interval between 
+`r ostAccuracyLowerGbm` and `r ostAccuracyUpperGbm`. 
+ 
+#Final submission   
+We are now ready submit these results to the grader. These are the answers in order 
+as they were submitted to the grader, for which single files were generated.  
+```{r FinalSumbission, message=FALSE, comment=FALSE}
+#Function to generate the submission files.
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+#Get list of answers in order
+answers = predict(modelGbm,testData)
+
+#Produce files for submission
+pml_write_files(answers)
+```
+
+## Conclusion
+After a few set backs such as chasing down Principal Component Analysis with no success 
+and not being able to get the Random Forecast to complete in time on complete training 
+data, a perfect submission was produced which is generally satisfying in that it 
+appears to generalize well. Some improvements that could be made on future projects 
+that will save me a lot of head-ache:   
+* Do more small sample training/cross-validation when looking for and tuning models 
+as this can get quicker results that answer investigatory questions faster.   
+* This also leads to the possibilty of pre-tuning larger data-sets. One idea I had 
+was to run Random Forecast on multiple small samples to find a good `mtry` first.   
+* Do some bench-marks much earlier in the project life-cycle to get a good sense of 
+how long these models really take to run. Even though I started in the middle of 
+the week, some goose chases and dead-ends prevented me from getting to the full 
+training in time, and I may have planned better if I had good estimates.   
+
+#Appendix   
+## R Code used in the Study: 
+The following is a listing of all code used in this *machine learning* project. 
+ 
+###Data Preparation 
+**PackagesUsed** 
+```{r, PackagesUsed, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
+####Loading the Data 
+**LoadDataSet** 
+```{r, LoadDataSet, echo=TRUE, message = FALSE, comment = FALSE}
+```
+####Splitting the Data 
+**DataSplitting** 
+```{r, LoadDataSet, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
+###Data Exploration 
+####Principal Component Analysis 
+**Covariates**
+```{r, Covariates, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
+####Fitting a Tree to determine variable importance 
+**PlotImportantVariables** 
+```{r, PlotImportantVariables, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
+###Initial Models 
+#### First test model - CART 
+**SetSmallerTrainingSet** 
+```{r, SetSmallerTrainingSet, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
+#### Principal Component Analysis Models 
+**PrincipalComponentModels** 
+```{r, PrincipalComponentModels, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
+#### Random Forest Tuning 
+**RfTuning** 
+```{r, RfTuning, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
+###Model Selection 
+####Confusion Matrix 
+**ConfusionMatrix** 
+```{r, ConfusionMatrix, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
+####Confusion Matrix - Quadratic discriminant analysis
+**ConfusionMatrixQda**
+```{r, ConfusionMatrixQda, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
+####Confusion Matrix - General regression boosting 
+**ConfusionMatrixGbm**
+```{r, ConfusionMatrixGbm, echo=TRUE, message = FALSE, comment = FALSE, eval=FALSE}
+```
